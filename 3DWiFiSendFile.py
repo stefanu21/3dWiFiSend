@@ -1,301 +1,285 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
-
-# Known to work with QIDI X-Pro and X-Max 3dprinters
-
-# sources for M Commands:
-#
-# experimentation with 'echo "M4001" | nc -u 192.168.3.100 3000'
-#   -and-
-# observation of QIDI Print softare via tcpdump:  'sudo tcpdump -i en9 -nn -s0 -v host 192.168.3.100'
-#   -and-
-# https://reprap.org/wiki/G-code#M115:_Get_Firmware_Version_and_Capabilities
-# https://www.craftbot.nl/2015/07/07/list-of-m-and-g-commands-as-used-by-the-craftbot/
-# https://github.com/Photonsters/anycubic-photon-docs/blob/master/photon-blueprints/readme.md
-# https://github.com/Photonsters/anycubic-photon-docs/blob/master/photon-blueprints/ChituClientWifiProtocol-translated.txt
-
-import sys
 import platform
-import logging
+import argparse
 import time
 from socket import *
 import struct
-import traceback
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-import re
-
+import functools
+from textwrap import dedent
+import ipaddress
 import subprocess
 import os
 from os import path
 
-# TODO: should initialize with all data set - you know, encapsulation and all that...
-class WiFiDevice():
-    # TODO: put the codes in a separate file for ease of reading, etc
-    # TODO: better documentation on what codes do
-    CMD_PRINTING_STATUS = "M27" # reports on printing status
-    CMD_STARTWRITE_SD = "M28 "  # start writing datagrams to SD
-    CMD_ENDWRITE_SD = "M29 "    # stop writing datagrams to SD
-    CMD_GETFILELIST = "M20 "    # SD card file list. "M20 'P/<subdirectory>'"  second part is optional, root otherwise
-    CMD_DELETE_FILE_SD = "M30 "  # requires filename arguement
-    CMD_CURRENT_POSITION = "M114"   #current position
-    CMD_STATUS = "M115 "        # printer board manufacturer / firmware
-    CMD_MSTATUS = "M119 "
-    CMD_BED_INFO = "M4000 "
-    CMD_PRINTER_INFO = "M4001 " # printer bed info
-    CMD_FIRMWARE = "M4002 "
-    CMD_OFF = "M4003 "
-    CMD_PRINT_SD = "M6030 "
 
-    PORT = 3000
+def send_receive(func):
+    @functools.wraps(func)
+    def wrap(*args, **kwargs):
+        self = None
+        for i in args:
+            if isinstance(i, QidiConnect):
+                self = i
+                break
+
+        if self is None:
+            raise ValueError('no WifiDevice instance found')
+
+        rx_buf_size = 256
+        send = func(*args, **kwargs)
+        if self.debug:
+            print(f'send {send}')
+        if isinstance(send, str):
+            self.sock.sendto(bytes(send.encode('utf-8', 'ignore')), (self.host, self.port))
+        else:
+            self.sock.sendto(send, (self.host, self.port))
+
+        if kwargs.get('no_recv', False):
+            return
+
+        msg = self.sock.recv(rx_buf_size)
+        msg_len = len(msg)
+        buf = msg
+        while msg_len == rx_buf_size:
+            msg = self.sock.recv(rx_buf_size)
+            msg_len = len(msg)
+            buf += msg
+
+        if self.debug:
+            print(f'receive {buf.decode("utf-8", "replace")}')
+
+        return buf.decode('utf-8', 'replace')
+
+    return wrap
+
+
+class QidiConnect:
+    _cmd_dict = {
+        'printing_status': 'M27',
+        'start_write_to_sd': 'M28',
+        'end_write_to_sd': 'M29',
+        'get_file_list': 'M20',
+        'del_file_form_sd': 'M30',
+        'current_position': 'M114',
+        'device_info': 'M115',
+        'm_status': 'M119',
+        'bed_info': 'M4000',
+        'step_parameter': 'M4001',
+        'firmware': 'M4002',
+        'off': 'M4003',
+        'print': 'M6030',
+        'temp_info': 'M105',
+        'wifi_info': 'M99999',
+    }
+
     # TODO: find this in the windows qidi software install and refer to it
     # TODO: also add platform.system() check like below
     # TODO: and remove the .exe from git
     VC_COMPRESS = ".\VC_compress_gcode.exe"
     if platform.system() == 'Darwin':  # for MacOS.  wish python had proper ternary operators....
         VC_COMPRESS = "/Applications/QIDI-Print.app//Contents/MacOS/VC_compress_gcode_MAC"
-    CONNECT_TIMEOUT = 5
 
-    def __init__(self):
-        self.ipaddr = ''
-        self.name = 'undefined'
-        self.BUFSIZE = 256 * 5
-        self.RECVBUF = 256 * 5
-        self.gcodeFile = 'data.gcode'
-        self.fileName = 'data.gcode.tz'
-        self.dirPath = ''
-        self.sock = socket(AF_INET, SOCK_DGRAM)
-        self.sock.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
-        self.sock.setblocking(0) # note: experimental, default is 1
-        self.sock.settimeout(5)
-        self._file_encode = 'utf-8'
+    def __init__(self, name, g_code_file, host, port=3000):
+        self.debug = False
+        self.host = host
+        self.port = port
+        self.name = name
+        self.gcode_file = os.path.basename(g_code_file)
+        self.gcode_dir = os.path.dirname(g_code_file)
+        self.g_code_tar_file = None
+        self.g_code_tar_dir = None
+        self.e_mm_per_step = None
+        self.z_mm_per_step = None
+        self.y_mm_per_step = None
+        self.x_mm_per_step = None
 
-    def __str__(self):
-        s = ('Device addr:' + self.ipaddr + '==' + self.name)
-        return s
+        self.s_machine_type = None
+        self.s_x_max = None
+        self.s_y_max = None
+        self.s_z_max = None
 
-    def encodeCmd(self,cmd):
-        return cmd.encode(self._file_encode, 'ignore')
+        self.file_encode = None
+        self.sock = None
+        self.connect()
 
-    def decodeCmd(self,cmd):
-        return cmd.decode(self._file_encode,'ignore')
+        self.init_machine_data()
 
-    # TODO: check to see if file already exists, and recover if it does
-    def sendStartWriteSd(self):
-        cmd = self.CMD_STARTWRITE_SD + self.fileName
-        logger.info("Start write to SD: " + cmd)
-        self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-        message, address = self.sock.recvfrom(self.RECVBUF)
-        message = message.decode('utf-8','replace')
-        logger.info("Start write to SD result: " + message)
-        return
+    def disconnect(self):
+        print('disconnect')
+        if self.sock:
+            self.sock.close()
+            self.sock = None
 
-    # TODO: check if file is correct bytes, etc on SD after transfer
-    def sendEndWriteSd(self):
-        cmd = self.CMD_ENDWRITE_SD + self.fileName
-        logger.info("End write to SD: " + cmd)
-        self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-        message, address = self.sock.recvfrom(self.RECVBUF)
-        message = message.decode('utf-8','replace')
-        logger.info("End write to SD result: " + message)
-        return
+    def connect(self):
+        ip_addr = str(ipaddress.ip_address(self.host))
+        self.disconnect()
 
-    def sendCmd(self, cmd):
-        #cmd = self.CMD_GETFILELIST
-        logger.info("sending: " + cmd)
-        self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-        message, address = self.sock.recvfrom(self.RECVBUF)
-        message = message.decode('utf-8','replace')
-        logger.info("Get list of files result: " + message)
-        return
+        try:
+            self.sock = socket(AF_INET, SOCK_DGRAM)
+            self.sock.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
+            self.sock.setblocking(0)
+            self.sock.settimeout(5)
+            print('connected')
+        except socket.timeout as err:
+            raise TimeoutError(err)
 
-    def addCheckSum(self, data, seekPos):
+    def init_machine_data(self):
+        bed_info = self.get_step_parameters()
+        print(bed_info)
+        if not any(i for i in bed_info if i in ('X', 'Y', 'Z')):
+            raise ValueError('error get needed parameter from bed info')
+        for i in ('\r', '\n'):
+            bed_info = bed_info.replace(i, '')
 
-        seekArray = struct.pack('>I', seekPos)
+        bed_info = bed_info.split(' ')
+        for element in bed_info:
+            item = element.split(':')
+            if item[0] == 'X':
+                self.x_mm_per_step = item[1]
+            elif item[0] == 'Y':
+                self.y_mm_per_step = item[1]
+            elif item[0] == 'Z':
+                self.z_mm_per_step = item[1]
+            elif item[0] == 'E':
+                self.e_mm_per_step = item[1]
+            elif item[0] == 'T':
+                self.s_machine_type, self.s_x_max, self.s_y_max, self.s_z_max, dummy = item[1].split('/')
+            elif item[0] == 'U':
+                self.file_encode = item[1].replace("'", "")
+
+    def create_tar_file(self):
+        cmd = path.normpath(QidiConnect.VC_COMPRESS) + f' "{self.gcode_dir}/{self.gcode_file}" ' \
+              + " ".join((self.x_mm_per_step, self.y_mm_per_step, self.z_mm_per_step, self.e_mm_per_step)) \
+              + f' "{self.gcode_dir}" ' \
+              + ' '.join((self.s_x_max, self.s_y_max, self.s_z_max, self.s_machine_type))
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        try:
+            outs, err = proc.communicate(timeout=10)
+            outs = outs.decode('utf-8').splitlines()
+            print(outs)
+            output_file = [x for x in outs if 'open output file' in x][0]
+            output_file = output_file[len('open output file '):].split(' ')[0]
+            self.g_code_tar_file = os.path.basename(output_file)
+            self.g_code_tar_dir = os.path.dirname(output_file)
+
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            outs, errs = proc.communicate()
+            raise ValueError(f'error create tar file {errs}')
+
+    @send_receive
+    def start_write_to_sd_cmd(*args, **kwargs):
+        return QidiConnect._cmd_dict['start_write_to_sd'] + ' ' + args[0].g_code_tar_file
+
+    @send_receive
+    def end_write_to_sd_cmd(*args, **kwargs):
+        return QidiConnect._cmd_dict['end_write_to_sd'] + ' ' + args[0].g_code_tar_file
+
+    @send_receive
+    def send_file_chunk(*args, **kwargs):
+        data_array = bytearray(kwargs['data_chunk'])
+        data_len = len(data_array)
+
+        if data_len == 0:
+            raise ValueError('data size is zero')
+
+        seek_array = struct.pack('<I', kwargs['seek_pos'])
+        data_array += bytearray(seek_array)
 
         check_sum = 0
-        data += b"000000"
-        dataArray = bytearray(data)
+        for i in range(0, data_len + len(seek_array), 1):
+            check_sum ^= data_array[i]
 
-        datSize = len(dataArray) - 6
+        data_array += bytearray(b'00')
+        data_array[-2] = check_sum
+        data_array[-1] = 0x83
 
-        if datSize <= 0:
-            return
+        return data_array
 
-        dataArray[datSize] = seekArray[3]
-        dataArray[datSize + 1] = seekArray[2]
-        dataArray[datSize + 2] = seekArray[1]
-        dataArray[datSize + 3] = seekArray[0]
+    @send_receive
+    def sendFileChunk(*args, **kwargs):
+        data = args[0].addCheckSum(kwargs['buff'], kwargs['seekPos'])
+        if len(data) - 6 <= 0:
+            raise ValueError('data size is zero')
 
-        for i in range(0, datSize+4, 1):
-            check_sum ^= dataArray[i]
-
-        dataArray[datSize + 4] = check_sum
-        dataArray[datSize + 5] = 0x83
-
-        return dataArray
-
-    def sendFileChunk(self, buff, seekPos):
-
-        logger.info("File Position: " + str(seekPos))
-        tmpArray = bytearray(buff)
-        tmpSize = len(tmpArray)
-        if tmpSize <= 0:
-            return
-
-        dataArray = self.addCheckSum(buff, seekPos)
-
-        datSize = len(dataArray) - 6
-
-        if datSize <= 0:
-            logger.warning('Error computing checksum: Data size is 0')
-            return
-
-        self.sock.sendto(dataArray, (self.ipaddr, self.PORT))
-
-        message, address = self.sock.recvfrom(self.RECVBUF)
-        message = message.decode('utf-8','replace')
-        logger.info("Sending File Chunk result: " +  message)
-
-        return
-
+        return data
 
     def sendFile(self):
-
-        with open(self.fileName, 'rb', buffering=1) as fp:
+        print(f'start write to sd {self.start_write_to_sd_cmd()}')
+        # TODO fix time wait
+        time.sleep(3)
+        with open(self.g_code_tar_dir + '/' + self.g_code_tar_file, 'rb', buffering=1) as fp:
             while True:
-                seekPos = fp.tell()
-                chunk = fp.read(self.BUFSIZE)
+                seek_pos = fp.tell()
+                chunk = fp.read(1024)
                 if not chunk:
                     break
+                self.send_file_chunk(data_chunk=chunk, seek_pos=seek_pos, no_recv=False)
 
-                self.sendFileChunk(chunk, seekPos)
+        print(f'end write to sd - {self.end_write_to_sd_cmd()}')
 
-        logger.info("End write SendFile ")
-        fp.close()
+    @send_receive
+    def start_print(*args, **kwargs):
+        return QuidiConnect._cmd_dict['print'] + '":' + args[0].g_code_tar_file + '" I1'
 
-        return
+    @send_receive
+    def get_device_info(*args, **kwargs):
+        return QidiConnect._cmd_dict['device_info']
 
+    @send_receive
+    def get_firmware_info(*args, **kwargs):
+        return QidiConnect._cmd_dict['firmware']
 
-    def dataCompressThread(self):
-        logger.info("Compressing Gcode File")
-        self.datamask = '[0-9]{1,12}\.[0-9]{1,12}'
-        self.maxmask = '[0-9]'
-        tryCnt = 0
-        while True:# this creates the VC_COMPRESSOR command options for this specific printer based on it's bed info
-            try:
-                self.sock.sendto(self.encodeCmd(self.CMD_PRINTER_INFO), (self.ipaddr, self.PORT))
-                message, address = self.sock.recvfrom(self.BUFSIZE)
-                pattern = re.compile(self.datamask) # TODO: use this
-                msg = message.decode('utf-8','ignore')
-                if('X' not in msg or 'Y' not in msg or 'Z' not in msg ):
-                    continue
-                msg = msg.replace('\r','')
-                msg = msg.replace('\n', '')
-                msgs = msg.split(' ')
-                logger.info(msg)
-                e_mm_per_step = z_mm_per_step = y_mm_per_step = x_mm_per_step = '0.0'
-                s_machine_type = s_x_max = s_y_max = s_z_max = '0.0'
-                for item in msgs:
-                    _ = item.split(':')
-                    if(len(_) == 2):
-                        id = _[0]
-                        value = _[1]
-                        logger.info(_)
-                        if id == 'X':
-                            x_mm_per_step = value
-                        elif id == 'Y':
-                            y_mm_per_step = value
-                        elif id == 'Z':
-                           z_mm_per_step = value
-                        elif id == 'E':
-                            e_mm_per_step = value
-                        elif id == 'T':
-                            _ = value.split('/')
-                            if len(_) == 5:
-                                s_machine_type = _[0]
-                                s_x_max = _[1]
-                                s_y_max = _[2]
-                                s_z_max = _[3]
-                        elif id == 'U':
-                            self._file_encode = value.replace("'","")
-                cmd = path.normpath(self.VC_COMPRESS) + " \"" + self.gcodeFile + "\" " + x_mm_per_step + " " + y_mm_per_step + " " + z_mm_per_step + " " + e_mm_per_step\
-                         + ' \"' + path.normpath(".") + '\" ' + s_x_max + " " + s_y_max + " " + s_z_max + " " + s_machine_type
-                logger.info(cmd)
-                ret = subprocess.Popen(cmd,stdout=subprocess.PIPE,shell=True)
-                logger.info(ret.stdout.read().decode("utf-8", 'ignore'))
-                break
-            except timeout:
-                tryCnt += 1
-                if(tryCnt > 5):
-                    self._result = self.CONNECT_TIMEOUT
-                    logger.error("Error trying to contact printer to determine print characteristcs.")
-                    break
-            except:
-                logger.error("Serious problem attempting compression")
-                traceback.print_exc()
-                break
+    @send_receive
+    def get_step_parameters(*args, **kwargs):
+        return QidiConnect._cmd_dict['step_parameter']
 
-    def startPrint(self):
-        self.sock.settimeout(2)
-        try:
-            #cmd = self.CMD_PRINT_SD + '":' + self.fileName + '" I1'  # I1 option purpose is unknown? try removing?
-            cmd = 'M6030 ":' + self.fileName + '" I1'
-            self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-            message, address = self.sock.recvfrom(self.RECVBUF)
-        except:
-            logger.error("Serious problems starting the print:")
-            traceback.print_exc()
+    @send_receive
+    def get_bed_info(*args, **kwargs):
+        return QidiConnect._cmd_dict['bed_info']
 
-    def getPrinterInfo(self):
-        self.sock.settimeout(2)
-        try:
-            cmd = self.CMD_STATUS
-            self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-            message, address = self.sock.recvfrom(self.RECVBUF)
-            mess = message.decode('utf-8','replace')
-            return mess
-        except:
-            logger.error("problem getting printer info")
-            traceback.print_exc()
+    @send_receive
+    def get_temp_info(*args, **kwargs):
+        return QidiConnect._cmd_dict['temp_info']
 
-    def getFirmwareInfo(self):
-        self.sock.settimeout(self.CONNECT_TIMEOUT)
-        try:
-            cmd = self.CMD_FIRMWARE
-            self.sock.sendto(self.encodeCmd(cmd), (self.ipaddr, self.PORT))
-            message, address = self.sock.recvfrom(self.RECVBUF)
-            return message.decode('utf-8','replace')
-        except:
-            logger.error("problem getting printer info")
-            traceback.print_exc()
-
-def ReadFileChunk(filename, startPos, endPos):
+    @send_receive
+    def get_wifi_info(*args, **kwargs):
+        return QidiConnect._cmd_dict['wifi_info']
 
 
-    return
+def main():
+    """Main program
+    """
+    description = """Simple programm to send commands to Qidi Printers
+    """
+    parser = argparse.ArgumentParser(description=dedent(description))
+    parser.add_argument('-i',
+                        '--IPv4',
+                        action='store',
+                        dest='host',
+                        help='ip address (ipv4)')
+    parser.add_argument('-n',
+                        '--name',
+                        action='store',
+                        dest='name',
+                        help='3d printer name')
+    parser.add_argument('-f',
+                        action='store',
+                        dest='g_code_file',
+                        help='g-code file location')
+    parser.add_argument('-p',
+                        '--print',
+                        action='store_true',
+                        help='print file')
+
+    args = parser.parse_args()
+
+    dev = QidiConnect(args.name, args.g_code_file, args.host)
+    dev.create_tar_file()
+    dev.sendFile()
+
+    if args.print:
+        dev.start_print()
 
 
 if __name__ == '__main__':
-    printDev = WiFiDevice()
-    printDev.dirPath = os.path.dirname(os.path.realpath(__file__))
-    os.chdir(printDev.dirPath)
-    printDev.ipaddr = sys.argv[1]
-    printDev.name = 'Xpro'  # TODO: this should be detected at initialization instead of hardcoded
-    printDev.gcodeFile = sys.argv[2]
-    logger.info("Printer Info\r\n------------------")
-    logger.info("board/firmware info: " + printDev.getPrinterInfo())
-    logger.info("firmware version: " + printDev.getFirmwareInfo())
-    printDev.fileName = printDev.gcodeFile + '.tz'   
-    logger.info('File 1: ' +  printDev.gcodeFile + 'File 2: ' + printDev.fileName)
-    printDev.dataCompressThread()
-    time.sleep(2)
-    logger.info('3D Printer ' + printDev.name + ' IP address: ' + printDev.ipaddr)
-    printDev.sendStartWriteSd()
-    time.sleep(2)
-    printDev.sendFile()
-    printDev.sendEndWriteSd()
-    if len(sys.argv) >= 4 and sys.argv[3] == 'yes':
-        printDev.startPrint()
+    main()
