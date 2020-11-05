@@ -22,11 +22,11 @@ There is also a test file included, which is a small printer test file.
 To use make sure that you have a flash drive plugged into the printer. I find it is a lot more reliable over ethernet than over wifi but YMMV. 
 
 Here is how to use it:
-"python 3DWiFiSendFile.py [-p][-h] -i IPADDRESS -f FILE.GCODE"
+"python qidi_connect.py [-p][-h] -i IPADDRESS -f FILE.GCODE"
 
 example:
 
-    python3 3DWiFiSendFile.py -p -i 192.168.3.100 -f test.gcode
+    python3 qidi_connect.py -p -i 192.168.3.100 -f test.gcode
 
 
 note: Now works on mac and against QIDI X-MAX as well.
