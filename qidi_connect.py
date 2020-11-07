@@ -116,7 +116,7 @@ class QidiConnect:
             self.sock = socket(AF_INET, SOCK_DGRAM)
             self.sock.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
             self.sock.setblocking(0)
-            self.sock.settimeout(5)
+            self.sock.settimeout(15)
             print('connected')
         except socket.timeout as err:
             raise TimeoutError(err)
