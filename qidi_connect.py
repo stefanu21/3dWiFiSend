@@ -219,7 +219,7 @@ class QidiConnect:
 
     @send_receive
     def start_print(*args, **kwargs):
-        return QuidiConnect._cmd_dict['print'] + '":' + args[0].g_code_tar_file + '" I1'
+        return QidiConnect._cmd_dict['print'] + '":' + args[0].g_code_tar_file + '" I1'
 
     @send_receive
     def get_device_info(*args, **kwargs):
